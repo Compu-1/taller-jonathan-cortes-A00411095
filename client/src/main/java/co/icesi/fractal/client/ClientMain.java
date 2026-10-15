@@ -87,19 +87,30 @@ public class ClientMain {
 
             // 1. Línea Base Monohilo Local (T_sec)
             System.out.println("\n[1/3] Ejecutando línea base monohilo local (T_sec)...");
+            long tSecArg = (args.length >= 10) ? Long.parseLong(args[9]) : 0L; // arg 10 opcional: T_sec del monolito (ms)
             long t0Sec = System.currentTimeMillis();
             int[][] localMatrix = new int[height][width];
             double dx = (width > 1) ? (xMax - xMin) / (width - 1) : 0.0;
             double dy = (height > 1) ? (yMax - yMin) / (height - 1) : 0.0;
 
-            for (int y = 0; y < height; y++) {
-                double ci = yMin + y * dy;
-                for (int x = 0; x < width; x++) {
-                    double cr = xMin + x * dx;
-                    localMatrix[y][x] = MandelbrotCore.computePoint(cr, ci, maxIter);
+            if (tSecArg > 0) {
+                // Referencia en paralelo solo para validar; T_sec proviene del monolito
+                final int[][] lm = localMatrix;
+                final int fw = width, fi = maxIter;
+                final double fdx = dx, fdy = dy, fxMin = xMin, fyMin = yMin;
+                java.util.stream.IntStream.range(0, height).parallel().forEach(y -> {
+                    double ci = fyMin + y * fdy;
+                    for (int x = 0; x < fw; x++) lm[y][x] = MandelbrotCore.computePoint(fxMin + x * fdx, ci, fi);
+                });
+            } else {
+                for (int y = 0; y < height; y++) {
+                    double ci = yMin + y * dy;
+                    for (int x = 0; x < width; x++) {
+                        localMatrix[y][x] = MandelbrotCore.computePoint(xMin + x * dx, ci, maxIter);
+                    }
                 }
             }
-            long tSec = System.currentTimeMillis() - t0Sec;
+            long tSec = (tSecArg > 0) ? tSecArg : System.currentTimeMillis() - t0Sec;
             System.out.printf("[LINEA BASE] Tiempo Secuencial (T_sec): %d ms (%.2f s)%n", tSec, tSec / 1000.0);
 
             // 2. Solicitud de Renderizado al Clúster Distribuido (T_dist)

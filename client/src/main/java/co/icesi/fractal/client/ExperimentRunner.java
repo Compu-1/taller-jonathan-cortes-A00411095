@@ -54,38 +54,57 @@ public class ExperimentRunner {
             System.out.printf("Region / Preset: %s (%s)%n", region.getName(), region.getId());
             System.out.printf("Resolucion:      %dx%d | MaxIter: %d | Workers: %d%n%n", width, height, maxIter, p);
 
-            // 1. Linea base monohilo
-            System.out.println("Calculando tiempo secuencial monohilo T_sec...");
-            long t0Sec = System.currentTimeMillis();
-            double dx = (width > 1) ? (xMax - xMin) / (width - 1) : 0.0;
-            double dy = (height > 1) ? (yMax - yMin) / (height - 1) : 0.0;
-
-            for (int y = 0; y < height; y++) {
-                double ci = yMin + y * dy;
-                for (int x = 0; x < width; x++) {
-                    double cr = xMin + x * dx;
-                    MandelbrotCore.computePoint(cr, ci, maxIter);
+            // 1. Linea base monohilo: se reutiliza T_sec del monolito si se pasa como arg 7 (ms)
+            long tSec;
+            if (args.length >= 7 && Long.parseLong(args[6]) > 0) {
+                tSec = Long.parseLong(args[6]);
+                System.out.printf("T_sec (reutilizado del monolito) = %d ms (%.2f s)%n%n", tSec, tSec / 1000.0);
+            } else {
+                System.out.println("Calculando tiempo secuencial monohilo T_sec...");
+                long t0Sec = System.currentTimeMillis();
+                double dx0 = (width > 1) ? (xMax - xMin) / (width - 1) : 0.0;
+                double dy0 = (height > 1) ? (yMax - yMin) / (height - 1) : 0.0;
+                for (int y = 0; y < height; y++) {
+                    double ci = yMin + y * dy0;
+                    for (int x = 0; x < width; x++) {
+                        MandelbrotCore.computePoint(xMin + x * dx0, ci, maxIter);
+                    }
                 }
+                tSec = System.currentTimeMillis() - t0Sec;
+                System.out.printf("T_sec = %d ms (%.2f s)%n%n", tSec, tSec / 1000.0);
             }
-            long tSec = System.currentTimeMillis() - t0Sec;
-            System.out.printf("T_sec = %d ms (%.2f s)%n%n", tSec, tSec / 1000.0);
 
-            // Casos experimentales:
-            // Tipo 0 (FixedCount): N = 2, 4, 8, 16 franjas
-            // Tipo 1 (FixedTileSize): S = 32, 64, 128, 256 px
-            int[][] testCases = {
-                {0, 2},   // Franjas: 2
-                {0, 4},   // Franjas: 4
-                {0, 8},   // Franjas: 8
-                {0, 16},  // Franjas: 16
-                {1, 32},  // Baldosas: 32x32 px
-                {1, 64},  // Baldosas: 64x64 px (grano optimo)
-                {1, 128}, // Baldosas: 128x128 px
-                {1, 256}  // Baldosas: 256x256 px (grano grueso)
-            };
+            // Matriz de referencia (paralela, solo para validar celda por celda; no se mide)
+            boolean validate = !(args.length >= 8 && args[7].equals("novalidate"));
+            int[][] reference = null;
+            if (validate) {
+                System.out.println("Calculando matriz de referencia para validacion (paralelo local)...");
+                reference = new int[height][width];
+                final int[][] ref = reference;
+                final double fdx = (width > 1) ? (xMax - xMin) / (width - 1) : 0.0;
+                final double fdy = (height > 1) ? (yMax - yMin) / (height - 1) : 0.0;
+                final double fx = xMin, fy = yMin;
+                java.util.stream.IntStream.range(0, height).parallel().forEach(y -> {
+                    double ci = fy + y * fdy;
+                    for (int x = 0; x < width; x++) {
+                        ref[y][x] = MandelbrotCore.computePoint(fx + x * fdx, ci, maxIter);
+                    }
+                });
+            }
 
-            System.out.println("| Estrategia | Parámetro | Tareas Generadas | T_sec (ms) | T_dist (ms) | Speedup (S) | Eficiencia (E) |");
-            System.out.println("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |");
+            // Casos de la Tabla 1 del enunciado
+            // Tipo 0 (FixedCount): N = 2, 4, 16 franjas | Tipo 1 (FixedTileSize): S = 16 (opcional), 32, 64, 128, 256
+            boolean withTile16 = args.length >= 9 && args[8].equals("tile16");
+            int[][] testCases = withTile16
+                ? new int[][] {{0, 2}, {0, 4}, {0, 16}, {1, 16}, {1, 32}, {1, 64}, {1, 128}, {1, 256}}
+                : new int[][] {{0, 2}, {0, 4}, {0, 16}, {1, 32}, {1, 64}, {1, 128}, {1, 256}};
+
+            String header = "| Estrategia | Parámetro | Tareas Generadas | T_sec (ms) | T_dist (ms) | Speedup (S) | Eficiencia (E) | Validación |";
+            String sep = "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |";
+            System.out.println(header);
+            System.out.println(sep);
+            StringBuilder md = new StringBuilder(header).append('\n').append(sep).append('\n');
+            StringBuilder csv = new StringBuilder("estrategia,parametro,tareas,workers,t_sec_ms,t_dist_ms,speedup,eficiencia_pct,errores\n");
 
             for (int[] tc : testCases) {
                 int stType = tc[0];
@@ -98,16 +117,43 @@ public class ExperimentRunner {
                 );
 
                 long t0Dist = System.currentTimeMillis();
-                master.renderFractal(config);
+                int[][] dist = master.renderFractal(config);
                 long tDist = System.currentTimeMillis() - t0Dist;
+
+                long errors = -1;
+                if (reference != null) {
+                    errors = 0;
+                    for (int y = 0; y < height; y++) {
+                        if (!java.util.Arrays.equals(reference[y], dist[y])) {
+                            for (int x = 0; x < width; x++) if (reference[y][x] != dist[y][x]) errors++;
+                        }
+                    }
+                }
 
                 double speedup = (double) tSec / (double) Math.max(1, tDist);
                 double efficiency = (p > 0) ? (speedup / p) * 100.0 : 0.0;
 
-                int tasksCount = (stType == 0) ? stParam : (int) (Math.ceil((double) width / stParam) * Math.ceil((double) height / stParam));
+                int tasksCount = (stType == 0) ? Math.min(stParam, height)
+                    : (int) (Math.ceil((double) width / stParam) * Math.ceil((double) height / stParam));
+                String valid = (errors < 0) ? "n/a" : (errors == 0 ? "OK" : "FALLO(" + errors + ")");
 
-                System.out.printf("| %s | %d | %d | %d | %d | %.2fx | %.1f%% |%n",
-                    stName, stParam, tasksCount, tSec, tDist, speedup, efficiency);
+                String row = String.format("| %s | %d | %d | %d | %d | %.2fx | %.1f%% | %s |",
+                    stName, stParam, tasksCount, tSec, tDist, speedup, efficiency, valid);
+                System.out.println(row);
+                md.append(row).append('\n');
+                csv.append(String.format(java.util.Locale.ROOT, "%s,%d,%d,%d,%d,%d,%.4f,%.2f,%d%n",
+                    stName, stParam, tasksCount, p, tSec, tDist, speedup, efficiency, errors));
+            }
+
+            try {
+                java.nio.file.Path dir = java.nio.file.Paths.get("output");
+                java.nio.file.Files.createDirectories(dir);
+                String tag = String.format("%dx%d_%d_p%d", width, height, maxIter, p);
+                java.nio.file.Files.writeString(dir.resolve("resultados_exp1_" + tag + ".md"), md.toString());
+                java.nio.file.Files.writeString(dir.resolve("resultados_exp1_" + tag + ".csv"), csv.toString());
+                System.out.println("\nResultados guardados en output/resultados_exp1_" + tag + ".(md|csv)");
+            } catch (java.io.IOException e) {
+                System.err.println("[WARN] No se pudo guardar resultados: " + e.getMessage());
             }
 
             System.out.println("\n[FIN] Matriz experimental finalizada.");

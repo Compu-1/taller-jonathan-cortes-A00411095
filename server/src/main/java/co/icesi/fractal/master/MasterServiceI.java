@@ -31,6 +31,15 @@ public class MasterServiceI implements MasterService {
     private CompletableFuture<int[][]> jobCompletionFuture;
     private long jobStartTime;
     private final Object consolidationLock = new Object();
+    private volatile String currentJobId = "";
+
+    // Estadisticas por worker del job actual (para analizar desbalance de carga)
+    private final Map<String, LongAdderPair> workerStats = new ConcurrentHashMap<>();
+
+    private static final class LongAdderPair {
+        final java.util.concurrent.atomic.LongAdder tasks = new java.util.concurrent.atomic.LongAdder();
+        final java.util.concurrent.atomic.LongAdder computeMs = new java.util.concurrent.atomic.LongAdder();
+    }
 
     @Override
     public int[][] renderFractal(RenderConfig config, Current current) throws FractalException {
@@ -58,6 +67,8 @@ public class MasterServiceI implements MasterService {
         totalTasksCount.set(tiles.size());
         completedTasksCount.set(0);
 
+        workerStats.clear();
+        currentJobId = config.jobId;
         finalImageMatrix = new int[config.height][config.width];
         jobCompletionFuture = new CompletableFuture<>();
         jobStartTime = System.currentTimeMillis();
@@ -122,6 +133,12 @@ public class MasterServiceI implements MasterService {
             throw new FractalException("Resultado nulo recibido en el Master.");
         }
 
+        if (!result.jobId.equals(currentJobId)) {
+            System.err.printf("[MASTER] [WARN] Resultado descartado de job obsoleto '%s' (actual: '%s')%n",
+                result.jobId, currentJobId);
+            return;
+        }
+
         // Consolidacion incremental del bloque de pixeles en la matriz global
         synchronized (consolidationLock) {
             if (finalImageMatrix != null) {
@@ -135,6 +152,10 @@ public class MasterServiceI implements MasterService {
             }
         }
 
+        LongAdderPair st = workerStats.computeIfAbsent(result.workerId, k -> new LongAdderPair());
+        st.tasks.increment();
+        st.computeMs.add(result.computeTimeMs);
+
         int finished = completedTasksCount.incrementAndGet();
         int total = totalTasksCount.get();
 
@@ -143,6 +164,9 @@ public class MasterServiceI implements MasterService {
 
         // Cuando la ultima tarea es recibida, se completa el futuro de la operacion global
         if (finished >= total && jobCompletionFuture != null && !jobCompletionFuture.isDone()) {
+            System.out.println("[MASTER] Resumen por worker (tareas | tiempo de computo acumulado):");
+            workerStats.forEach((id, v) -> System.out.printf("[MASTER]   %s: %d tareas, %d ms%n",
+                id, v.tasks.sum(), v.computeMs.sum()));
             jobCompletionFuture.complete(finalImageMatrix);
         }
     }
